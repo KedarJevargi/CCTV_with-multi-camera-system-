@@ -139,15 +139,71 @@ class ScreenshotMatcher:
                 "margin": 0.0,
                 "candidates": [],
                 "per_camera_best": {},
+                "confirmed_camera_ids": [],
                 "message": "No candidates found in Qdrant database."
             }
 
-        # 3. Build per-camera best-match map from the full unfiltered pool
-        per_camera_best: Dict[str, Dict[str, Any]] = {}
+        # 3. Independent Per-Camera Gating & Evaluation
+        # Group raw hits by camera to calculate per-camera top scores and margins
+        hits_by_camera: Dict[str, List[Dict[str, Any]]] = {}
         for hit in raw_hits:
             cam = hit["payload"]["camera_id"]
-            if cam not in per_camera_best:
-                per_camera_best[cam] = self._format_hit(hit)
+            if cam not in hits_by_camera:
+                hits_by_camera[cam] = []
+            hits_by_camera[cam].append(hit)
+
+        per_camera_best: Dict[str, Dict[str, Any]] = {}
+        confirmed_camera_ids: List[str] = []
+
+        for cam_id in config.CAMERA_VIDEOS.keys():
+            cam_hits = hits_by_camera.get(cam_id, [])
+            if not cam_hits:
+                continue
+
+            top_cam_hit = cam_hits[0]
+            top_cam_score = float(top_cam_hit["score"])
+            second_cam_score = float(cam_hits[1]["score"]) if len(cam_hits) > 1 else 0.0
+            cam_margin = top_cam_score - second_cam_score
+
+            # Check if top candidate and runner-up co-occur simultaneously in the same timeframe
+            is_cooccurring = False
+            competitor_track = None
+            if len(cam_hits) > 1:
+                p1 = top_cam_hit["payload"]
+                p2 = cam_hits[1]["payload"]
+                competitor_track = p2.get("track_id")
+                start1, end1 = p1.get("start_time", 0.0), p1.get("end_time", 0.0)
+                start2, end2 = p2.get("start_time", 0.0), p2.get("end_time", 0.0)
+                # Overlap in time check (true physical competitors on screen at the same second)
+                is_cooccurring = max(start1, start2) <= min(end1, end2)
+
+            fmt = self._format_hit(top_cam_hit)
+            fmt["margin"] = round(cam_margin, 4)
+            fmt["is_cooccurring"] = is_cooccurring
+            fmt["competitor_track_id"] = competitor_track
+            fmt["second_score"] = round(second_cam_score, 4)
+
+            # Independent threshold and ambiguity gating for this camera
+            if top_cam_score >= score_threshold:
+                # If candidates do NOT co-occur simultaneously, they are often track fragments of the same person
+                # across brief occlusions. In that case, apply a relaxed margin (0.01) to avoid false rejection.
+                effective_margin = ambiguity_margin if is_cooccurring else min(ambiguity_margin, 0.01)
+
+                if cam_margin >= effective_margin:
+                    fmt["status"] = "CONFIRMED_MATCH"
+                    fmt["is_confirmed"] = True
+                    fmt["status_label"] = "Confirmed Match"
+                    confirmed_camera_ids.append(cam_id)
+                else:
+                    fmt["status"] = "AMBIGUOUS"
+                    fmt["is_confirmed"] = False
+                    fmt["status_label"] = "Ambiguous Match"
+            else:
+                fmt["status"] = "NOT_DETECTED"
+                fmt["is_confirmed"] = False
+                fmt["status_label"] = "Not Detected (Below Threshold)"
+
+            per_camera_best[cam_id] = fmt
 
         # 4. Global top-k from filtered hits
         global_top = filtered_hits[:top_k]
@@ -213,9 +269,10 @@ class ScreenshotMatcher:
             "identity_label": identity_display,
             "match_score": round(top1_score, 4),
             "margin": round(margin, 4),
-            "top_candidate": candidates_info[0],
+            "top_candidate": candidates_info[0] if candidates_info else None,
             "candidates": candidates_info,
             "per_camera_best": per_camera_best,
+            "confirmed_camera_ids": confirmed_camera_ids,
             "message": msg
         }
 

@@ -201,9 +201,18 @@ if workflow_mode == "Query by Image":
         st.markdown("---")
         st.subheader("Step 2: Identification & Evidence")
 
-        col_btn, col_thresh, col_filter = st.columns([1, 2, 2])
+        col_btn, col_thresh, col_margin, col_filter = st.columns([1, 1.5, 1.5, 2])
         with col_thresh:
             threshold = st.slider("Cosine Similarity Threshold:", min_value=0.50, max_value=0.85, value=config.DEFAULT_MATCH_THRESHOLD, step=0.01)
+        with col_margin:
+            ambiguity_margin = st.slider(
+                "Ambiguity Margin Threshold:",
+                min_value=0.00,
+                max_value=0.10,
+                value=0.02,
+                step=0.005,
+                help="Minimum score gap required between top candidate and competing bystanders in the same camera."
+            )
         with col_filter:
             all_cams = list(config.CAMERA_VIDEOS.keys())
             camera_filter = st.multiselect(
@@ -225,7 +234,7 @@ if workflow_mode == "Query by Image":
                     crop_image=query_crop_image,
                     top_k=num_cameras * 4,
                     score_threshold=threshold,
-                    ambiguity_margin=config.AMBIGUITY_THRESHOLD,
+                    ambiguity_margin=ambiguity_margin,
                     camera_filter=camera_filter if camera_filter else None
                 )
                 st.session_state["query_result"] = query_result
@@ -252,25 +261,34 @@ if workflow_mode == "Query by Image":
                 st.markdown(f'<div class="badge-unknown">✖ UNKNOWN (Similarity: {match_score:.3f} < {threshold:.2f})</div>', unsafe_allow_html=True)
                 st.error(query_result["message"])
 
+            # Identify confirmed cameras via Independent Per-Camera Gating
+            confirmed_cameras = [
+                c for c in active_cameras
+                if per_camera_best.get(c, {}).get("is_confirmed", False)
+            ]
+
             # Metric details (Summary across cameras)
             if top_cand:
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Top Match Camera", top_cand["camera_id"])
                 m2.metric("Top Track ID", top_cand["track_id"])
                 m3.metric("Top Score", f"{match_score:.4f}")
-                m4.metric("Cameras Matched", f"{len(active_cameras)} / {len(config.CAMERA_VIDEOS)}")
+                m4.metric("Cameras Confirmed", f"{len(confirmed_cameras)} / {len(active_cameras)}")
 
-            # Visual Evidence Generation across ALL cameras
+            # Visual Evidence Generation across cameras (Gated independently)
             st.markdown("---")
-            st.markdown("### 🎬 Video Evidence with Green Bounding Boxes (All Cameras)")
-            st.caption(f"Displaying target tracking evidence across all {len(active_cameras)} cameras with green bounding boxes.")
+            st.markdown("### 🎬 Video Evidence with Green Bounding Boxes")
+            st.caption(
+                f"Independent Per-Camera Gating: Confirmed in **{len(confirmed_cameras)}** of **{len(active_cameras)}** cameras. "
+                "Cameras where the person is absent or ambiguous will not render bounding boxes on bystanders."
+            )
 
-            if active_cameras and decision != "UNKNOWN":
+            if confirmed_cameras:
                 gen = get_evidence_generator()
                 camera_evidence = {}
 
-                with st.spinner(f"Generating / loading annotated video evidence for all {len(active_cameras)} cameras..."):
-                    for cam_id in active_cameras:
+                with st.spinner(f"Generating / loading annotated video evidence for confirmed cameras ({len(confirmed_cameras)})..."):
+                    for cam_id in confirmed_cameras:
                         cand = per_camera_best[cam_id]
                         t_id = cand["track_id"]
                         try:
@@ -288,7 +306,7 @@ if workflow_mode == "Query by Image":
 
                 # Create tabs for Multi-Camera Grid plus individual camera inspection
                 tab_titles = ["📺 All Cameras (Multi-Camera Grid)"] + [
-                    f"{'⭐ ' if cam == top_cand.get('camera_id') else ''}{cam} ({per_camera_best[cam]['score']:.3f})"
+                    f"{'⭐ ' if cam == top_cand.get('camera_id') else ''}{'🟢 ' if cam in confirmed_cameras else ('⚠ ' if per_camera_best[cam].get('status') == 'AMBIGUOUS' else '⚪ ')}{cam} ({per_camera_best[cam]['score']:.3f})"
                     for cam in active_cameras
                 ]
                 tabs = st.tabs(tab_titles)
@@ -296,80 +314,159 @@ if workflow_mode == "Query by Image":
                 # Tab 0: All Cameras Side-by-Side (2x2 Grid)
                 with tabs[0]:
                     st.markdown("#### Synchronized Multi-Camera Video Evidence Grid")
+                    st.caption("Confirmed detections show green bounding boxes. Absent or ambiguous cameras display safe status cards.")
                     grid_cols = st.columns(2)
                     for idx, cam_id in enumerate(active_cameras):
-                        data = camera_evidence.get(cam_id)
-                        if not data:
-                            continue
-                        cand = data["candidate"]
-                        ev = data["evidence"]
+                        cand = per_camera_best[cam_id]
                         is_top = (top_cand and top_cand.get("camera_id") == cam_id)
+                        is_conf = cam_id in confirmed_cameras
+                        status = cand.get("status", "NOT_DETECTED")
 
                         with grid_cols[idx % 2]:
-                            st.markdown(
-                                f"**{'⭐ ' if is_top else ''}{cam_id}** — "
-                                f"`{cand['track_id']}` | Score: **{cand['score']:.4f}** "
-                                f"{'🟢' if cand['score'] >= threshold else '🔴'}"
-                            )
-                            st.caption(f"⏱ Time: {format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
+                            if is_conf and cam_id in camera_evidence:
+                                data = camera_evidence[cam_id]
+                                ev = data["evidence"]
+                                st.markdown(
+                                    f"**{'⭐ ' if is_top else ''}{cam_id}** — "
+                                    f"`{cand['track_id']}` | Score: **{cand['score']:.4f}** 🟢 (Confirmed Match)"
+                                )
+                                st.caption(f"⏱ Time: {format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
 
-                            ev_path = ev["evidence_video_path"]
-                            if os.path.exists(ev_path):
-                                with open(ev_path, "rb") as vf:
-                                    st.video(vf.read(), format="video/mp4")
+                                ev_path = ev["evidence_video_path"]
+                                if os.path.exists(ev_path):
+                                    with open(ev_path, "rb") as vf:
+                                        st.video(vf.read(), format="video/mp4")
+                                else:
+                                    st.error(f"Evidence video file missing for {cam_id}")
+
+                                # Show keyframe thumbnails below video
+                                kfs = ev.get("keyframes", [])
+                                if kfs:
+                                    kf_cols = st.columns(min(len(kfs), 3))
+                                    for k_idx, kf in enumerate(kfs[:3]):
+                                        with kf_cols[k_idx]:
+                                            if os.path.exists(kf["image_path"]):
+                                                st.image(kf["image_path"], caption=f"{format_timestamp(kf['timestamp'])}", use_container_width=True)
+                            elif status == "AMBIGUOUS":
+                                # Ambiguous Candidates
+                                st.markdown(f"**{cam_id}** — ⚠ Ambiguous Candidate")
+                                st.markdown(
+                                    f'<div style="background-color: #292318; color: #FFE082; border: 1px solid #6d4c1b; border-radius: 8px; padding: 25px 15px; text-align: center; margin-bottom: 12px;">'
+                                    f'<h4 style="color: #FFB74D; margin-top: 0; margin-bottom: 8px;">⚠ Ambiguous Detection in {cam_id}</h4>'
+                                    f'<p style="color: #FFE0B2; font-size: 0.90rem; margin-bottom: 12px;">'
+                                    f'Candidate similarity is high: <b style="color: #ffffff;">{cand["score"]:.4f}</b> (≥ {threshold:.2f})<br>'
+                                    f'Competitor margin is small: <b>{cand.get("margin", 0):.4f}</b> &lt; margin threshold ({ambiguity_margin:.2f})'
+                                    f'</p>'
+                                    f'<span style="background-color: #4A3419; color: #FFD54F; padding: 4px 10px; border-radius: 4px; font-size: 0.82rem; font-weight: 500;">Status: Ambiguous Match</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True
+                                )
                             else:
-                                st.error(f"Evidence video file missing for {cam_id}")
-
-                            # Show keyframe thumbnails below video
-                            kfs = ev.get("keyframes", [])
-                            if kfs:
-                                kf_cols = st.columns(min(len(kfs), 3))
-                                for k_idx, kf in enumerate(kfs[:3]):
-                                    with kf_cols[k_idx]:
-                                        if os.path.exists(kf["image_path"]):
-                                            st.image(kf["image_path"], caption=f"{format_timestamp(kf['timestamp'])}", use_container_width=True)
+                                # Target NOT detected in this camera
+                                st.markdown(f"**{cam_id}** — ⚪ Target Not Detected")
+                                st.markdown(
+                                    f'<div style="background-color: #1e1e24; color: #E0E0E0; border: 1px solid #3d3d45; border-radius: 8px; padding: 25px 15px; text-align: center; margin-bottom: 12px;">'
+                                    f'<h4 style="color: #ff5252; margin-top: 0; margin-bottom: 8px;">❌ Target Not Detected in {cam_id}</h4>'
+                                    f'<p style="color: #B0B0B0; font-size: 0.90rem; margin-bottom: 12px;">'
+                                    f'Independent gating filtered out similar-dressed bystanders.<br>'
+                                    f'Highest observed similarity: <b style="color: #ffffff;">{cand["score"]:.4f}</b> (&lt; Threshold: {threshold:.2f})'
+                                    f'</p>'
+                                    f'<span style="background-color: #33333d; color: #ff8a80; padding: 4px 10px; border-radius: 4px; font-size: 0.82rem; font-weight: 500;">Status: {cand.get("status_label", "Not Detected")}</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True
+                                )
                             st.markdown("---")
 
                 # Tabs 1..N: Individual Camera Detailed Views
                 for idx, cam_id in enumerate(active_cameras):
                     with tabs[idx + 1]:
-                        data = camera_evidence.get(cam_id)
-                        if not data:
-                            st.warning(f"No evidence data found for {cam_id}")
-                            continue
-                        cand = data["candidate"]
-                        ev = data["evidence"]
+                        cand = per_camera_best[cam_id]
                         is_top = (top_cand and top_cand.get("camera_id") == cam_id)
+                        is_conf = cam_id in confirmed_cameras
+                        status = cand.get("status", "NOT_DETECTED")
 
-                        st.markdown(f"#### {'⭐ Top Match: ' if is_top else ''}{cam_id} Evidence Inspection")
-                        c_m1, c_m2, c_m3, c_m4 = st.columns(4)
-                        c_m1.metric("Camera ID", cam_id)
-                        c_m2.metric("Track ID", cand["track_id"])
-                        c_m3.metric("Similarity Score", f"{cand['score']:.4f}")
-                        c_m4.metric("Time Observed", f"{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
+                        if is_conf and cam_id in camera_evidence:
+                            data = camera_evidence[cam_id]
+                            ev = data["evidence"]
 
-                        col_v, col_kf = st.columns([3, 2])
-                        with col_v:
-                            st.markdown(f"**Playable Video Clip ({cam_id}):**")
-                            ev_path = ev["evidence_video_path"]
-                            if os.path.exists(ev_path):
-                                with open(ev_path, "rb") as vf:
-                                    st.video(vf.read(), format="video/mp4")
-                            else:
-                                st.error("Evidence video file could not be opened.")
+                            st.markdown(f"#### {'⭐ Top Match: ' if is_top else ''}{cam_id} Evidence Inspection")
+                            c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                            c_m1.metric("Camera ID", cam_id)
+                            c_m2.metric("Track ID", cand["track_id"])
+                            c_m3.metric("Similarity Score", f"{cand['score']:.4f}")
+                            c_m4.metric("Time Observed", f"{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
 
-                        with col_kf:
-                            st.markdown(f"**Keyframe Snapshots with Green Bounding Boxes ({cam_id}):**")
-                            keyframes = ev.get("keyframes", [])
-                            for kf in keyframes[:3]:
-                                if os.path.exists(kf["image_path"]):
-                                    st.image(kf["image_path"], caption=f"Timestamp: {format_timestamp(kf['timestamp'])}", use_container_width=True)
+                            col_v, col_kf = st.columns([3, 2])
+                            with col_v:
+                                st.markdown(f"**Playable Video Clip ({cam_id}):**")
+                                ev_path = ev["evidence_video_path"]
+                                if os.path.exists(ev_path):
+                                    with open(ev_path, "rb") as vf:
+                                        st.video(vf.read(), format="video/mp4")
+                                else:
+                                    st.error("Evidence video file could not be opened.")
+
+                            with col_kf:
+                                st.markdown(f"**Keyframe Snapshots with Green Bounding Boxes ({cam_id}):**")
+                                keyframes = ev.get("keyframes", [])
+                                for kf in keyframes[:3]:
+                                    if os.path.exists(kf["image_path"]):
+                                        st.image(kf["image_path"], caption=f"Timestamp: {format_timestamp(kf['timestamp'])}", use_container_width=True)
+                        elif status == "AMBIGUOUS":
+                            st.warning(
+                                f"**Ambiguous match in {cam_id} (Multiple close candidates).** "
+                                f"The top candidate track (`{cand['track_id']}`) achieved a high similarity of **{cand['score']:.4f}** (above threshold {threshold:.2f}). "
+                                f"However, runner-up candidate `{cand.get('competitor_track_id', 'competitor')}` scored closely (margin **{cand.get('margin', 0):.4f}** &lt; margin threshold **{ambiguity_margin:.2f}**). "
+                                f"Automatic bounding box confirmation is withheld to prevent misidentifying between similar candidates. You can lower the Ambiguity Margin slider to accept."
+                            )
+                            c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                            c_m1.metric("Camera ID", cam_id)
+                            c_m2.metric("Top Candidate Track", cand["track_id"])
+                            c_m3.metric("Similarity Score", f"{cand['score']:.4f}")
+                            c_m4.metric("Decision", "Ambiguous Match")
+
+                            with st.expander("🔍 Inspect candidate details & competitor in this camera"):
+                                crop_p = cand["representative_crop_path"]
+                                exp_col1, exp_col2 = st.columns([1, 2])
+                                with exp_col1:
+                                    if os.path.exists(crop_p):
+                                        st.image(crop_p, caption=f"Candidate: {cand['track_id']}", use_container_width=True)
+                                with exp_col2:
+                                    st.markdown(f"**Track ID:** `{cand['track_id']}`")
+                                    st.markdown(f"**Similarity Score:** `{cand['score']:.4f}` (Threshold: `{threshold:.2f}`)")
+                                    st.markdown(f"**Score Margin:** `{cand.get('margin', 0):.4f}` (Margin Threshold: `{ambiguity_margin:.2f}`)")
+                                    st.markdown(f"**Competitor Track:** `{cand.get('competitor_track_id', 'N/A')}` (Score: `{cand.get('second_score', 0):.4f}`)")
+                                    st.markdown(f"**Time Window:** `{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])}`")
+                        else:
+                            st.warning(
+                                f"**Target person was not detected in {cam_id}.** "
+                                f"The closest candidate track (`{cand['track_id']}`) had a similarity score of **{cand['score']:.4f}**, "
+                                f"which is below the confirmation threshold (**{threshold:.2f}**). Video bounding boxes are withheld to avoid false identification."
+                            )
+                            c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                            c_m1.metric("Camera ID", cam_id)
+                            c_m2.metric("Closest Candidate Track", cand["track_id"])
+                            c_m3.metric("Highest Similarity", f"{cand['score']:.4f}")
+                            c_m4.metric("Decision", cand.get("status_label", "Not Detected"))
+
+                            with st.expander("🔍 Inspect closest candidate in this camera (Unconfirmed / Bystander)"):
+                                crop_p = cand["representative_crop_path"]
+                                exp_col1, exp_col2 = st.columns([1, 2])
+                                with exp_col1:
+                                    if os.path.exists(crop_p):
+                                        st.image(crop_p, caption=f"Closest candidate: {cand['track_id']}", use_container_width=True)
+                                with exp_col2:
+                                    st.markdown(f"**Track ID:** `{cand['track_id']}`")
+                                    st.markdown(f"**Similarity Score:** `{cand['score']:.4f}` (Required: `{threshold:.2f}`)")
+                                    st.markdown(f"**Margin:** `{cand.get('margin', 0):.4f}`")
+                                    st.markdown(f"**Time Window:** `{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])}`")
+                                    st.info("This person was classified as a bystander with similar clothing and rejected.")
             else:
-                st.info("Visual evidence generation is withheld when match confidence is insufficient or Unknown.")
+                st.info("Visual evidence generation is withheld because the target person was not confirmed in any camera above the confidence threshold.")
 
             # ── Per-Camera Best Match Panel ──────────────────────────────────
             st.markdown("---")
-            st.markdown("### 📷 Best Match Per Camera")
+            st.markdown("### 📷 Per-Camera Match Status (Independent Gating)")
             per_camera_best = query_result.get("per_camera_best", {})
             cam_ids = list(config.CAMERA_VIDEOS.keys())
             pcam_cols = st.columns(len(cam_ids))
@@ -380,14 +477,34 @@ if workflow_mode == "Query by Image":
                     st.markdown(header)
                     if cam_id in per_camera_best:
                         best = per_camera_best[cam_id]
+                        is_conf = best.get("is_confirmed", False)
+                        status = best.get("status", "CONFIRMED_MATCH" if is_conf else "NOT_DETECTED")
                         crop_p = best["representative_crop_path"]
-                        if os.path.exists(crop_p):
-                            st.image(crop_p, use_container_width=True)
-                        score_color = "🟢" if best["score"] >= threshold else "🔴"
-                        st.caption(f"{score_color} Score: **{best['score']:.4f}**")
-                        st.caption(f"Track: `{best['track_id']}`")
-                        st.caption(f"Identity: `{best['identity_label']}`")
-                        st.caption(f"{format_timestamp(best['start_time'])} → {format_timestamp(best['end_time'])}")
+
+                        if is_conf:
+                            if os.path.exists(crop_p):
+                                st.image(crop_p, use_container_width=True)
+                            st.markdown('<div class="badge-confirmed" style="margin-bottom:6px;">🟢 Confirmed Match</div>', unsafe_allow_html=True)
+                            st.caption(f"Score: **{best['score']:.4f}** (Margin: {best.get('margin', 0):.3f})")
+                            st.caption(f"Track: `{best['track_id']}`")
+                            st.caption(f"Identity: `{best['identity_label']}`")
+                            st.caption(f"{format_timestamp(best['start_time'])} → {format_timestamp(best['end_time'])}")
+                        elif status == "AMBIGUOUS":
+                            if os.path.exists(crop_p):
+                                st.image(crop_p, use_container_width=True)
+                            st.markdown('<div class="badge-ambiguous" style="margin-bottom:6px;">⚠ Ambiguous Match</div>', unsafe_allow_html=True)
+                            st.caption(f"Score: **{best['score']:.4f}** (Margin: {best.get('margin', 0):.3f})")
+                            st.caption(f"Track: `{best['track_id']}`")
+                            st.caption("_Margin below ambiguity threshold_")
+                        else:
+                            st.markdown('<div class="badge-unknown" style="margin-bottom:6px; background-color:#616161;">❌ Not Detected</div>', unsafe_allow_html=True)
+                            st.caption(f"Similarity: **{best['score']:.4f}** < {threshold:.2f}")
+                            st.caption("Target absent from this camera.")
+                            with st.expander("View closest candidate"):
+                                if os.path.exists(crop_p):
+                                    st.image(crop_p, use_container_width=True)
+                                st.caption(f"Track: `{best['track_id']}`")
+                                st.caption(f"Score: **{best['score']:.4f}**")
                     else:
                         st.caption("_No tracks found_")
 
