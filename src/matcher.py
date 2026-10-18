@@ -8,14 +8,15 @@ from src.detector import PersonDetector
 from src.embeddings import OSNetFeatureExtractor
 from src.qdrant_store import QdrantStore
 from src.identity_registry import IdentityRegistry
+from src.face_module import FaceBiometricModule
 from src.utils import crop_person_image
 
 class ScreenshotMatcher:
     """
     Handles screenshot-based person re-identification queries:
     - Detects and crops person candidates from uploaded screenshots (or uses pre-cropped images)
-    - Extracts OSNet 512-dim appearance embedding
-    - Queries Qdrant vector database for candidate tracks across cameras
+    - Stage 1: Extracts OSNet 512-dim appearance embedding for fast vector search in Qdrant
+    - Stage 2: Biometric Face Verification (YuNet + SFace) to confirm matches and veto bystanders in similar clothing
     - Applies validated thresholding and ambiguity checks
     - Maps retrieved tracks to registered identities in resources.json
     - Reports 'Unknown' for uncertain or low-similarity queries
@@ -25,12 +26,14 @@ class ScreenshotMatcher:
         qstore: Optional[QdrantStore] = None,
         extractor: Optional[OSNetFeatureExtractor] = None,
         detector: Optional[PersonDetector] = None,
-        registry: Optional[IdentityRegistry] = None
+        registry: Optional[IdentityRegistry] = None,
+        face_module: Optional[FaceBiometricModule] = None
     ):
         self.qstore = qstore or QdrantStore()
         self.extractor = extractor or OSNetFeatureExtractor()
         self.detector = detector or PersonDetector()
         self.registry = registry or IdentityRegistry()
+        self.face_module = face_module or FaceBiometricModule()
 
     def process_screenshot_crops(self, image: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -99,7 +102,8 @@ class ScreenshotMatcher:
         top_k: int = 5,
         score_threshold: float = config.DEFAULT_MATCH_THRESHOLD,
         ambiguity_margin: float = config.AMBIGUITY_THRESHOLD,
-        camera_filter: Optional[List[str]] = None
+        camera_filter: Optional[List[str]] = None,
+        face_mode: str = "Adaptive"
     ) -> Dict[str, Any]:
         """
         Executes query for a single person crop against Qdrant across all cameras.
@@ -112,24 +116,60 @@ class ScreenshotMatcher:
         """
         num_cameras = len(config.CAMERA_VIDEOS)
 
-        # 1. Extract 512-dim embedding
+        # 1. Stage 1: Extract OSNet 512-dim appearance embedding
         query_vector = self.extractor.extract_features(crop_image)
 
-        # 2. Fetch a large pool to guarantee per-camera coverage
-        fetch_limit = max(top_k * num_cameras, 20)
-        raw_hits = self.qstore.search_similar(
-            query_vector=query_vector,
-            limit=fetch_limit,
-            camera_id=None  # Always search all cameras at this stage
-        )
-
-        # Apply optional camera filter AFTER fetching (preserves per_camera_best for full map)
-        if camera_filter:
-            filtered_hits = [h for h in raw_hits if h["payload"]["camera_id"] in camera_filter]
+        # Stage 2: Extract Face Biometric embedding if face detected in query and face_mode is active
+        if face_mode != "Appearance Only":
+            query_face_info = self.face_module.detect_face(crop_image)
+            query_face_emb = self.face_module.extract_embedding(crop_image, query_face_info) if query_face_info else None
         else:
-            filtered_hits = raw_hits
+            query_face_info = None
+            query_face_emb = None
 
-        if not filtered_hits:
+        def verify_crop_face(crop_path: Optional[str]) -> Dict[str, Any]:
+            if not crop_path or not Path(crop_path).exists() or query_face_emb is None:
+                return {
+                    "face_status": "UNAVAILABLE",
+                    "face_similarity": None,
+                    "face_verdict": "UNAVAILABLE",
+                    "face_message": "Face not available for verification"
+                }
+            cand_img = cv2.imread(crop_path)
+            if cand_img is None:
+                return {
+                    "face_status": "UNAVAILABLE",
+                    "face_similarity": None,
+                    "face_verdict": "UNAVAILABLE",
+                    "face_message": "Candidate crop image unreadable"
+                }
+            cand_face_emb = self.face_module.extract_embedding(cand_img)
+            ver = self.face_module.verify_pair(query_face_emb, cand_face_emb)
+            return {
+                "face_status": ver["verdict"],
+                "face_similarity": ver["similarity"],
+                "face_verdict": ver["verdict"],
+                "face_message": ver["message"]
+            }
+
+        # 2. Fetch candidate pools for each camera independently to guarantee 100% per-camera recall
+        target_cameras = [c for c in (camera_filter if camera_filter else config.CAMERA_VIDEOS.keys())]
+        hits_by_camera: Dict[str, List[Dict[str, Any]]] = {}
+        all_hits: List[Dict[str, Any]] = []
+
+        for cam_id in config.CAMERA_VIDEOS.keys():
+            if cam_id in target_cameras:
+                c_hits = self.qstore.search_similar(
+                    query_vector=query_vector,
+                    limit=50,
+                    camera_id=cam_id
+                )
+                hits_by_camera[cam_id] = c_hits
+                all_hits.extend(c_hits)
+            else:
+                hits_by_camera[cam_id] = []
+
+        if not all_hits:
             return {
                 "decision": "UNKNOWN",
                 "matched_track_id": None,
@@ -140,32 +180,46 @@ class ScreenshotMatcher:
                 "candidates": [],
                 "per_camera_best": {},
                 "confirmed_camera_ids": [],
+                "has_query_face": query_face_emb is not None,
                 "message": "No candidates found in Qdrant database."
             }
 
-        # 3. Independent Per-Camera Gating & Evaluation
-        # Group raw hits by camera to calculate per-camera top scores and margins
-        hits_by_camera: Dict[str, List[Dict[str, Any]]] = {}
-        for hit in raw_hits:
-            cam = hit["payload"]["camera_id"]
-            if cam not in hits_by_camera:
-                hits_by_camera[cam] = []
-            hits_by_camera[cam].append(hit)
-
+        # 3. Two-Stage Candidate Re-Ranking & Independent Per-Camera Gating
         per_camera_best: Dict[str, Dict[str, Any]] = {}
         confirmed_camera_ids: List[str] = []
+        all_evaluated_candidates: List[Dict[str, Any]] = []
 
         for cam_id in config.CAMERA_VIDEOS.keys():
             cam_hits = hits_by_camera.get(cam_id, [])
             if not cam_hits:
                 continue
 
+            # Evaluate top candidates in this camera with Stage 2 Face Verification
+            evaluated_cam_candidates: List[Dict[str, Any]] = []
+            best_bio_candidate: Optional[Dict[str, Any]] = None
+            highest_face_sim = -1.0
+
+            for hit_idx, hit in enumerate(cam_hits[:25]):
+                fmt = self._format_hit(hit)
+                face_eval = verify_crop_face(fmt.get("representative_crop_path"))
+                fmt.update(face_eval)
+                evaluated_cam_candidates.append(fmt)
+                all_evaluated_candidates.append(fmt)
+
+                # Check for confirmed biometric face match
+                f_sim = face_eval.get("face_similarity")
+                if face_eval.get("face_verdict") == "CONFIRMED_MATCH" and f_sim is not None:
+                    if f_sim > highest_face_sim:
+                        highest_face_sim = f_sim
+                        best_bio_candidate = fmt
+
+            # Calculate runner-up margin for top appearance candidates
             top_cam_hit = cam_hits[0]
             top_cam_score = float(top_cam_hit["score"])
             second_cam_score = float(cam_hits[1]["score"]) if len(cam_hits) > 1 else 0.0
             cam_margin = top_cam_score - second_cam_score
 
-            # Check if top candidate and runner-up co-occur simultaneously in the same timeframe
+            # Check time co-occurrence between top 2 appearance candidates
             is_cooccurring = False
             competitor_track = None
             if len(cam_hits) > 1:
@@ -174,105 +228,147 @@ class ScreenshotMatcher:
                 competitor_track = p2.get("track_id")
                 start1, end1 = p1.get("start_time", 0.0), p1.get("end_time", 0.0)
                 start2, end2 = p2.get("start_time", 0.0), p2.get("end_time", 0.0)
-                # Overlap in time check (true physical competitors on screen at the same second)
                 is_cooccurring = max(start1, start2) <= min(end1, end2)
 
-            fmt = self._format_hit(top_cam_hit)
-            fmt["margin"] = round(cam_margin, 4)
-            fmt["is_cooccurring"] = is_cooccurring
-            fmt["competitor_track_id"] = competitor_track
-            fmt["second_score"] = round(second_cam_score, 4)
+            # ── Selection Hierarchy for this Camera ──
+            if best_bio_candidate is not None:
+                # Priority 1: Biometrically Confirmed True Match!
+                # Promoted over any bystanders who had similar clothes but no face visible
+                best = best_bio_candidate
+                best["status"] = "CONFIRMED_MATCH"
+                best["is_confirmed"] = True
+                best["status_label"] = f"Biometrically Confirmed Match (Face: {best['face_similarity']:.2f})"
+                best["margin"] = round(cam_margin, 4)
+                best["is_cooccurring"] = is_cooccurring
+                best["competitor_track_id"] = competitor_track
+                confirmed_camera_ids.append(cam_id)
+            else:
+                # Priority 2: Filter out bystanders vetoed by face mismatch
+                valid_candidates = [
+                    c for c in evaluated_cam_candidates
+                    if c.get("face_verdict") != "VETOED_MISMATCH"
+                ]
 
-            # Independent threshold and ambiguity gating for this camera
-            if top_cam_score >= score_threshold:
-                # If candidates do NOT co-occur simultaneously, they are often track fragments of the same person
-                # across brief occlusions. In that case, apply a relaxed margin (0.01) to avoid false rejection.
-                effective_margin = ambiguity_margin if is_cooccurring else min(ambiguity_margin, 0.01)
-
-                if cam_margin >= effective_margin:
-                    fmt["status"] = "CONFIRMED_MATCH"
-                    fmt["is_confirmed"] = True
-                    fmt["status_label"] = "Confirmed Match"
-                    confirmed_camera_ids.append(cam_id)
+                if not valid_candidates:
+                    # All candidates were vetoed bystanders
+                    best = evaluated_cam_candidates[0]
+                    best["status"] = "NOT_DETECTED"
+                    best["is_confirmed"] = False
+                    best["status_label"] = "Rejected (Face Mismatch)"
+                    best["rejection_reason"] = "Bystanders wearing similar clothing vetoed by facial biometrics."
                 else:
-                    fmt["status"] = "AMBIGUOUS"
-                    fmt["is_confirmed"] = False
-                    fmt["status_label"] = "Ambiguous Match"
-            else:
-                fmt["status"] = "NOT_DETECTED"
-                fmt["is_confirmed"] = False
-                fmt["status_label"] = "Not Detected (Below Threshold)"
+                    best = valid_candidates[0]
+                    best["margin"] = round(cam_margin, 4)
+                    best["is_cooccurring"] = is_cooccurring
+                    best["competitor_track_id"] = competitor_track
 
-            per_camera_best[cam_id] = fmt
+                    if best["score"] >= 0.85:
+                        # Overwhelming Appearance Match: 85%+ similarity
+                        best["status"] = "CONFIRMED_MATCH"
+                        best["is_confirmed"] = True
+                        best["status_label"] = "Appearance Confirmed Match (High Confidence)"
+                        confirmed_camera_ids.append(cam_id)
+                    elif best["score"] >= score_threshold:
+                        # Fallback to Appearance Re-ID (When face is turned away, back view, or unavailable)
+                        effective_margin = ambiguity_margin if is_cooccurring else min(ambiguity_margin, 0.01)
+                        if cam_margin >= effective_margin:
+                            best["status"] = "CONFIRMED_MATCH"
+                            best["is_confirmed"] = True
+                            best["status_label"] = "Appearance Confirmed Match"
+                            confirmed_camera_ids.append(cam_id)
+                        else:
+                            best["status"] = "AMBIGUOUS"
+                            best["is_confirmed"] = False
+                            best["status_label"] = "Ambiguous Match"
+                    else:
+                        best["status"] = "NOT_DETECTED"
+                        best["is_confirmed"] = False
+                        best["status_label"] = "Not Detected (Below Threshold)"
 
-        # 4. Global top-k from filtered hits
-        global_top = filtered_hits[:top_k]
+            per_camera_best[cam_id] = best
 
-        # 5. Analyze global top-1 for decision
-        top1 = global_top[0]
-        top1_score = top1["score"]
-        top2_score = global_top[1]["score"] if len(global_top) > 1 else 0.0
-        margin = top1_score - top2_score
+        # 4. Global top candidates and top-1 decision
+        # Prioritize biometrically confirmed candidates at the top of the global results
+        bio_matches = [c for c in all_evaluated_candidates if c.get("face_verdict") == "CONFIRMED_MATCH"]
+        bio_matches.sort(key=lambda c: c.get("face_similarity", 0.0), reverse=True)
 
-        # Check registered identity for top-1
-        is_reg, id_label = self.registry.is_track_registered(top1["payload"]["track_id"])
-        identity_display = id_label if is_reg else "Unregistered Person"
+        appearance_matches = [c for c in all_evaluated_candidates if c.get("face_verdict") != "CONFIRMED_MATCH"]
+        appearance_matches.sort(key=lambda c: c["score"], reverse=True)
 
-        # 6. Apply decision logic
-        if top1_score >= score_threshold:
-            if margin >= ambiguity_margin:
-                decision = "CONFIRMED_MATCH"
-                msg = (
-                    f"Confident match with track {top1['payload']['track_id']} "
-                    f"({identity_display}) at similarity {top1_score:.3f} (margin: {margin:.3f})."
-                )
-            else:
-                decision = "AMBIGUOUS"
-                identity_display = "Unknown (Ambiguous Candidate)"
-                msg = (
-                    f"Match candidate {top1['payload']['track_id']} exceeded threshold "
-                    f"({top1_score:.3f}), but top-2 margin ({margin:.3f}) is below "
-                    f"ambiguity threshold ({ambiguity_margin:.2f})."
-                )
-        else:
-            decision = "UNKNOWN"
-            identity_display = "Unknown"
+        # Global top list: best biometric matches first, then top appearance hits
+        global_candidates = bio_matches + appearance_matches
+
+        # Top-1 candidate determination
+        if bio_matches:
+            top1 = bio_matches[0]
+            top1_score = top1["score"]
+            top2_score = bio_matches[1]["score"] if len(bio_matches) > 1 else (appearance_matches[0]["score"] if appearance_matches else 0.0)
+            margin = round(abs(top1_score - top2_score), 4)
+
+            is_reg, id_label = self.registry.is_track_registered(top1["track_id"])
+            identity_display = id_label if is_reg else "Unregistered Person"
+
+            decision = "CONFIRMED_MATCH"
             msg = (
-                f"Similarity score ({top1_score:.3f}) is below confidence threshold "
-                f"({score_threshold:.2f}). Reported as Unknown."
+                f"Biometrically confirmed match with track {top1['track_id']} "
+                f"({identity_display}) at face similarity {top1['face_similarity']:.3f} (body score: {top1_score:.3f})."
             )
+        else:
+            top1 = global_candidates[0]
+            top1_score = top1["score"]
+            top2_score = global_candidates[1]["score"] if len(global_candidates) > 1 else 0.0
+            margin = round(top1_score - top2_score, 4)
 
-        # 7. Merge global top-k + per-camera bests (deduplicated, sorted by score)
+            is_reg, id_label = self.registry.is_track_registered(top1["track_id"])
+            identity_display = id_label if is_reg else "Unregistered Person"
+
+            if top1_score >= score_threshold:
+                if margin >= ambiguity_margin:
+                    decision = "CONFIRMED_MATCH"
+                    msg = (
+                        f"Confident match with track {top1['track_id']} "
+                        f"({identity_display}) at similarity {top1_score:.3f} (margin: {margin:.3f})."
+                    )
+                else:
+                    decision = "AMBIGUOUS"
+                    identity_display = "Unknown (Ambiguous Candidate)"
+                    msg = (
+                        f"Match candidate {top1['track_id']} exceeded threshold "
+                        f"({top1_score:.3f}), but top-2 margin ({margin:.3f}) is below "
+                        f"ambiguity threshold ({ambiguity_margin:.2f})."
+                    )
+            else:
+                decision = "UNKNOWN"
+                identity_display = "Unknown"
+                msg = (
+                    f"Similarity score ({top1_score:.3f}) is below confidence threshold "
+                    f"({score_threshold:.2f}). Reported as Unknown."
+                )
+
+        # Deduplicate candidates list
         seen_track_ids = set()
-        candidates_info = []
-        for hit in global_top:
-            fmt = self._format_hit(hit)
-            if fmt["track_id"] not in seen_track_ids:
-                seen_track_ids.add(fmt["track_id"])
-                candidates_info.append(fmt)
-
-        # Inject per-camera bests not already in global top-k
-        for cam_id in config.CAMERA_VIDEOS.keys():
-            if cam_id in per_camera_best:
-                best = per_camera_best[cam_id]
-                if best["track_id"] not in seen_track_ids:
-                    seen_track_ids.add(best["track_id"])
-                    candidates_info.append(best)
-
-        # Sort merged list by score descending
-        candidates_info.sort(key=lambda c: c["score"], reverse=True)
+        dedup_candidates = []
+        for c in global_candidates:
+            if c["track_id"] not in seen_track_ids:
+                seen_track_ids.add(c["track_id"])
+                dedup_candidates.append(c)
 
         return {
             "decision": decision,
-            "matched_track_id": top1["payload"]["track_id"] if decision == "CONFIRMED_MATCH" else None,
-            "camera_id": top1["payload"]["camera_id"] if decision == "CONFIRMED_MATCH" else None,
+            "matched_track_id": top1["track_id"] if decision == "CONFIRMED_MATCH" else None,
+            "camera_id": top1["camera_id"] if decision == "CONFIRMED_MATCH" else None,
             "identity_label": identity_display,
             "match_score": round(top1_score, 4),
             "margin": round(margin, 4),
-            "top_candidate": candidates_info[0] if candidates_info else None,
-            "candidates": candidates_info,
+            "top_candidate": dedup_candidates[0] if dedup_candidates else None,
+            "candidates": dedup_candidates,
             "per_camera_best": per_camera_best,
             "confirmed_camera_ids": confirmed_camera_ids,
+            "has_query_face": query_face_emb is not None,
+            "query_face_info": {
+                "confidence": query_face_info["confidence"],
+                "bbox": query_face_info["bbox"]
+            } if query_face_info else None,
             "message": msg
         }
 

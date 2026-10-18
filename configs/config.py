@@ -20,6 +20,8 @@ RESOURCES_JSON_PATH = STORAGE_DIR / "resources.json"
 MODELS_DIR = BASE_DIR / "models"
 YOLO_MODEL_PATH = MODELS_DIR / "yolov8n.pt"
 OSNET_MODEL_PATH = MODELS_DIR / "osnet_x1_0_market1501.pth"
+YUNET_MODEL_PATH = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
+SFACE_MODEL_PATH = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 
 # Ensure runtime directories exist
 for p in [INPUT_VIDEOS_DIR, CROPS_DIR, EVIDENCE_DIR, QDRANT_PATH, METADATA_DIR, MODELS_DIR]:
@@ -56,3 +58,10 @@ QDRANT_COLLECTION_NAME = "person_reid_tracks"
 # Cross-Camera and Query Matching Thresholds
 DEFAULT_MATCH_THRESHOLD = 0.65 # Cosine similarity threshold for confirmed match
 AMBIGUITY_THRESHOLD = 0.05     # Top1 vs Top2 margin to prevent accepting ambiguous candidates
+
+# Face Biometrics Stage 2 Thresholds (YuNet + SFace)
+FACE_CONF_THRESHOLD = 0.75     # Strict confidence threshold to eliminate false detections on hair/back of head
+FACE_MATCH_THRESHOLD = 0.363   # SFace cosine similarity threshold for confirmed same person
+FACE_MISMATCH_THRESHOLD = 0.25 # Hard veto threshold: below this is guaranteed different person
+
+

@@ -18,6 +18,7 @@ from src.qdrant_store import QdrantStore
 from src.identity_registry import IdentityRegistry
 from src.matcher import ScreenshotMatcher
 from src.evidence_generator import EvidenceGenerator
+from src.face_module import FaceBiometricModule
 from src.utils import load_json, format_timestamp
 
 # Page Configuration
@@ -76,6 +77,15 @@ st.markdown("""
         font-size: 0.95rem;
         display: inline-block;
     }
+    .badge-biometric {
+        background-color: #00897b;
+        color: white;
+        padding: 0.35rem 0.8rem;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 0.95rem;
+        display: inline-block;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -87,6 +97,10 @@ def get_feature_extractor():
 @st.cache_resource
 def get_person_detector():
     return PersonDetector()
+
+@st.cache_resource
+def get_face_module():
+    return FaceBiometricModule()
 
 @st.cache_resource
 def get_qdrant_store():
@@ -106,11 +120,13 @@ def get_screenshot_matcher():
     detector = get_person_detector()
     qstore = get_qdrant_store()
     registry = get_identity_registry()
+    face_module = get_face_module()
     return ScreenshotMatcher(
         qstore=qstore,
         extractor=extractor,
         detector=detector,
-        registry=registry
+        registry=registry,
+        face_module=face_module
     )
 
 # Sidebar Navigation
@@ -198,10 +214,33 @@ if workflow_mode == "Query by Image":
             query_crop_image = crops_data[0]["crop_image"]
             st.success("Target person crop prepared for appearance matching.")
 
+        # Real-time face biometric visibility check on the target query crop
+        query_face_check = matcher.face_module.detect_face(query_crop_image)
+        if query_face_check:
+            st.info(
+                f"👤 **Frontal Face Detected** (Confidence: {query_face_check['confidence']:.2f}). "
+                "Two-stage verification is active: Face Biometrics will cross-verify to veto similar-dressed bystanders."
+            )
+        else:
+            st.warning(
+                "ℹ️ **No Frontal Face Detected (Back View / Turned Away / Occluded)**. "
+                "The system is automatically relying 100% on **Body Dress & Clothes Appearance (OSNet Re-ID)**. "
+                "Face vetoes are disabled to guarantee full recall on back views."
+            )
+
         st.markdown("---")
         st.subheader("Step 2: Identification & Evidence")
 
-        col_btn, col_thresh, col_margin, col_filter = st.columns([1, 1.5, 1.5, 2])
+        col_mode, col_thresh, col_margin, col_filter = st.columns([1.6, 1.2, 1.2, 1.8])
+        with col_mode:
+            verification_mode = st.selectbox(
+                "Verification Modality:",
+                [
+                    "Adaptive (Face if clear, else Body)",
+                    "Body Dress Only (Ignore Face)"
+                ],
+                help="Adaptive uses Face Biometrics when a front face is visible, and seamlessly falls back to Body Dress for back/profile views. 'Body Dress Only' forces pure appearance matching."
+            )
         with col_thresh:
             threshold = st.slider("Cosine Similarity Threshold:", min_value=0.50, max_value=0.85, value=config.DEFAULT_MATCH_THRESHOLD, step=0.01)
         with col_margin:
@@ -221,12 +260,14 @@ if workflow_mode == "Query by Image":
                 default=all_cams,
                 help="Restrict search to specific cameras. All selected by default."
             )
-        with col_btn:
-            run_query = st.button("🔍 Search Person in Qdrant", type="primary")
+
+        run_query = st.button("🔍 Search Person in Qdrant", type="primary")
 
         num_cameras = len(config.CAMERA_VIDEOS)
         if "query_result" not in st.session_state:
             st.session_state["query_result"] = None
+
+        selected_face_mode = "Appearance Only" if "Body Dress Only" in verification_mode else "Adaptive"
 
         if run_query:
             with st.spinner("Extracting OSNet 512-dim embedding and querying Qdrant..."):
@@ -235,7 +276,8 @@ if workflow_mode == "Query by Image":
                     top_k=num_cameras * 4,
                     score_threshold=threshold,
                     ambiguity_margin=ambiguity_margin,
-                    camera_filter=camera_filter if camera_filter else None
+                    camera_filter=camera_filter if camera_filter else None,
+                    face_mode=selected_face_mode
                 )
                 st.session_state["query_result"] = query_result
         else:
@@ -390,11 +432,13 @@ if workflow_mode == "Query by Image":
                             ev = data["evidence"]
 
                             st.markdown(f"#### {'⭐ Top Match: ' if is_top else ''}{cam_id} Evidence Inspection")
-                            c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                            c_m1, c_m2, c_m3, c_m4, c_m5 = st.columns(5)
                             c_m1.metric("Camera ID", cam_id)
                             c_m2.metric("Track ID", cand["track_id"])
-                            c_m3.metric("Similarity Score", f"{cand['score']:.4f}")
-                            c_m4.metric("Time Observed", f"{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
+                            c_m3.metric("Body Re-ID", f"{cand['score']:.4f}")
+                            f_sim = cand.get("face_similarity")
+                            c_m4.metric("Face Biometrics", f"{f_sim:.4f}" if f_sim is not None else "Not Visible")
+                            c_m5.metric("Duration", f"{cand['duration']}s")
 
                             col_v, col_kf = st.columns([3, 2])
                             with col_v:
@@ -466,7 +510,7 @@ if workflow_mode == "Query by Image":
 
             # ── Per-Camera Best Match Panel ──────────────────────────────────
             st.markdown("---")
-            st.markdown("### 📷 Per-Camera Match Status (Independent Gating)")
+            st.markdown("### 📷 Per-Camera Match Status (Two-Stage Verification)")
             per_camera_best = query_result.get("per_camera_best", {})
             cam_ids = list(config.CAMERA_VIDEOS.keys())
             pcam_cols = st.columns(len(cam_ids))
@@ -479,16 +523,34 @@ if workflow_mode == "Query by Image":
                         best = per_camera_best[cam_id]
                         is_conf = best.get("is_confirmed", False)
                         status = best.get("status", "CONFIRMED_MATCH" if is_conf else "NOT_DETECTED")
+                        face_verdict = best.get("face_verdict", "UNAVAILABLE")
+                        face_sim = best.get("face_similarity")
                         crop_p = best["representative_crop_path"]
 
                         if is_conf:
                             if os.path.exists(crop_p):
                                 st.image(crop_p, use_container_width=True)
-                            st.markdown('<div class="badge-confirmed" style="margin-bottom:6px;">🟢 Confirmed Match</div>', unsafe_allow_html=True)
-                            st.caption(f"Score: **{best['score']:.4f}** (Margin: {best.get('margin', 0):.3f})")
+                            if face_verdict == "CONFIRMED_MATCH":
+                                st.markdown('<div class="badge-biometric" style="margin-bottom:6px;">👤 Biometric Match</div>', unsafe_allow_html=True)
+                                st.caption(f"Face Sim: **{face_sim:.4f}** 🟢")
+                            elif best["score"] >= 0.85:
+                                st.markdown('<div class="badge-confirmed" style="margin-bottom:6px;">🟢 Appearance Match</div>', unsafe_allow_html=True)
+                                st.caption(f"Body: **{best['score']:.4f}** (High-Confidence Match)")
+                            else:
+                                st.markdown('<div class="badge-confirmed" style="margin-bottom:6px;">🟢 Appearance Match</div>', unsafe_allow_html=True)
+                                st.caption(f"Body: **{best['score']:.4f}** (Margin: {best.get('margin', 0):.3f})")
                             st.caption(f"Track: `{best['track_id']}`")
                             st.caption(f"Identity: `{best['identity_label']}`")
                             st.caption(f"{format_timestamp(best['start_time'])} → {format_timestamp(best['end_time'])}")
+                        elif face_verdict == "VETOED_MISMATCH" and best["score"] >= threshold:
+                            st.markdown('<div class="badge-unknown" style="margin-bottom:6px; background-color:#c62828;">❌ Bystander Vetoed</div>', unsafe_allow_html=True)
+                            st.caption(f"Clothes Sim: **{best['score']:.4f}** (Passed)")
+                            st.caption(f"Face Sim: **{face_sim:.4f}** (Mismatch)")
+                            st.caption("Bystander vetoed by face biometric!")
+                            with st.expander("Inspect vetoed bystander"):
+                                if os.path.exists(crop_p):
+                                    st.image(crop_p, use_container_width=True)
+                                st.caption(f"Track: `{best['track_id']}`")
                         elif status == "AMBIGUOUS":
                             if os.path.exists(crop_p):
                                 st.image(crop_p, use_container_width=True)
