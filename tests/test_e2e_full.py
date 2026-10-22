@@ -41,21 +41,23 @@ def run_all_e2e_tests():
     print("[TEST 3 PASS] Timestamps validated: start_time <= end_time across all tracks.")
 
     # 4. Frame-level bounding boxes are saved and can be retrieved
-    sample_track = cam1_tracks["Camera_1_7"]
+    sample_track_id = sorted(list(cam1_tracks.keys()))[0]
+    sample_track = cam1_tracks[sample_track_id]
     obs_list = sample_track["frame_observations"]
     assert len(obs_list) == sample_track["total_frames_observed"]
     for o in obs_list[:5]:
         x1, y1, x2, y2 = o["bbox"]
         assert x2 > x1 and y2 > y1
-    print(f"[TEST 4 PASS] Frame-level bounding boxes verified ({len(obs_list)} observations in sample track).")
+    print(f"[TEST 4 PASS] Frame-level bounding boxes verified ({len(obs_list)} observations in sample track {sample_track_id}).")
 
     # 5. Qdrant stores expected vectors and payloads
     qstore = QdrantStore()
-    assert qstore.count_tracks() == len(cam1_tracks) + len(cam2_tracks)
-    sample_pt = qstore.get_track("Camera_1_7")
+    assert qstore.count_tracks(camera_id="Camera_1") == len(cam1_tracks)
+    assert qstore.count_tracks(camera_id="Camera_2") == len(cam2_tracks)
+    sample_pt = qstore.get_track(sample_track_id)
     assert sample_pt is not None
     assert len(sample_pt["vector"]) == 512
-    print(f"[TEST 5 PASS] Qdrant point count ({qstore.count_tracks()}) and 512-dim vectors verified.")
+    print(f"[TEST 5 PASS] Qdrant point count verified (Cam1={len(cam1_tracks)}, Cam2={len(cam2_tracks)}, Total={qstore.count_tracks()}) and 512-dim vectors verified.")
 
     # 6. resources.json is created and updated correctly
     test_reg_path = config.STORAGE_DIR / "test_resources.json"
@@ -137,7 +139,7 @@ def run_all_e2e_tests():
     query_crop = cv2.imread(sample_track["representative_crop_path"])
     q_res = matcher.query_crop(query_crop)
     assert q_res["decision"] == "CONFIRMED_MATCH"
-    assert q_res["top_candidate"]["track_id"] == "Camera_1_7"
+    assert q_res["top_candidate"]["track_id"] == sample_track_id
     print(f"[TEST 11 PASS] Query screenshot retrieved correct candidate: {q_res['top_candidate']['track_id']}.")
 
     # 12. Query with no reliable candidate returns Unknown
@@ -148,7 +150,7 @@ def run_all_e2e_tests():
 
     # 13. Green bounding boxes are rendered using correct track metadata
     gen = EvidenceGenerator()
-    ev_data = gen.generate_annotated_evidence("Camera_1_7", display_label="Test Person", max_frames_to_render=30)
+    ev_data = gen.generate_annotated_evidence(sample_track_id, display_label="Test Person", max_frames_to_render=30)
     assert Path(ev_data["evidence_video_path"]).exists()
     assert len(ev_data["keyframes"]) > 0
     # Check green color in bounding box snapshot
@@ -176,7 +178,7 @@ def run_all_e2e_tests():
 
     # 16. Reprocessing videos does not silently corrupt or duplicate the dataset
     count_before = qstore.count_tracks()
-    qstore.upsert_tracks({"Camera_1_7": sample_track})
+    qstore.upsert_tracks({sample_track_id: sample_track})
     count_after = qstore.count_tracks()
     assert count_before == count_after, f"Point duplication detected! {count_before} vs {count_after}"
     print(f"[TEST 16 PASS] Reprocessing idempotency verified: count remained exactly {count_after}.")

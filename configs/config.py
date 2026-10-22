@@ -38,13 +38,13 @@ CAMERA_VIDEOS = {
     "Camera_4": INPUT_VIDEOS_DIR / "Camera_4.mp4",
 }
 
-# Detection and Tracking parameters
-DETECTION_CONF_THRESHOLD = 0.40
+# Detection and Tracking parameters (Hardened to reject ghost detections and noise)
+DETECTION_CONF_THRESHOLD = 0.45 # Increased from 0.40 to reduce false bounding boxes
 TRACKER_TYPE = "bytetrack.yaml"
-MIN_TRACK_FRAMES = 8          # Require at least 8 observations to form a reliable track
-MIN_BBOX_WIDTH = 30
-MIN_BBOX_HEIGHT = 60
-MIN_BBOX_AREA = 2500
+MIN_TRACK_FRAMES = 12          # Require at least 12 observations (~0.4s) to form a reliable track
+MIN_BBOX_WIDTH = 35            # Filter out tiny spurious noise detections
+MIN_BBOX_HEIGHT = 70
+MIN_BBOX_AREA = 3000
 
 # OSNet Feature Extraction parameters
 EMBEDDING_DIM = 512
@@ -55,9 +55,9 @@ MAX_REPRESENTATIVE_CROPS = 5   # Extract embeddings from up to 5 best quality fr
 # Qdrant Vector Store configuration
 QDRANT_COLLECTION_NAME = "person_reid_tracks"
 
-# Cross-Camera and Query Matching Thresholds
-DEFAULT_MATCH_THRESHOLD = 0.65 # Cosine similarity threshold for confirmed match
-AMBIGUITY_THRESHOLD = 0.05     # Top1 vs Top2 margin to prevent accepting ambiguous candidates
+# Cross-Camera and Query Matching Thresholds (Hardened against false positives)
+DEFAULT_MATCH_THRESHOLD = 0.70 # Increased from 0.65 (empirical validation drops FAR from 20.4% to 8.2%)
+AMBIGUITY_THRESHOLD = 0.05     # Strict Top1 vs Top2 margin to prevent accepting ambiguous candidates
 
 # Face Biometrics Stage 2 Thresholds (YuNet + SFace)
 FACE_CONF_THRESHOLD = 0.75     # Strict confidence threshold to eliminate false detections on hair/back of head

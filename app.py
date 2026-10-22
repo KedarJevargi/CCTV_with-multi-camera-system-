@@ -248,7 +248,7 @@ if workflow_mode == "Query by Image":
                 "Ambiguity Margin Threshold:",
                 min_value=0.00,
                 max_value=0.10,
-                value=0.02,
+                value=config.AMBIGUITY_THRESHOLD,
                 step=0.005,
                 help="Minimum score gap required between top candidate and competing bystanders in the same camera."
             )

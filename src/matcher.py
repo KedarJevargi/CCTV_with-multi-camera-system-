@@ -258,28 +258,35 @@ class ScreenshotMatcher:
                     best["rejection_reason"] = "Bystanders wearing similar clothing vetoed by facial biometrics."
                 else:
                     best = valid_candidates[0]
+                    # Compute true runner-up margin among valid (non-vetoed) candidates
+                    if len(valid_candidates) > 1:
+                        cam_margin = float(valid_candidates[0]["score"]) - float(valid_candidates[1]["score"])
+                        competitor_track = valid_candidates[1].get("track_id")
+                    else:
+                        cam_margin = float(valid_candidates[0]["score"])
+                        competitor_track = None
+
                     best["margin"] = round(cam_margin, 4)
                     best["is_cooccurring"] = is_cooccurring
                     best["competitor_track_id"] = competitor_track
 
-                    if best["score"] >= 0.85:
-                        # Overwhelming Appearance Match: 85%+ similarity
-                        best["status"] = "CONFIRMED_MATCH"
-                        best["is_confirmed"] = True
-                        best["status_label"] = "Appearance Confirmed Match (High Confidence)"
-                        confirmed_camera_ids.append(cam_id)
-                    elif best["score"] >= score_threshold:
-                        # Fallback to Appearance Re-ID (When face is turned away, back view, or unavailable)
-                        effective_margin = ambiguity_margin if is_cooccurring else min(ambiguity_margin, 0.01)
+                    # Tier 1 Hardening: Strictly enforce ambiguity margin across all candidates.
+                    # High similarity alone does not bypass margin checks (different people can score >= 0.85 in similar clothing).
+                    effective_margin = max(ambiguity_margin, 0.04)
+
+                    if best["score"] >= score_threshold:
                         if cam_margin >= effective_margin:
                             best["status"] = "CONFIRMED_MATCH"
                             best["is_confirmed"] = True
-                            best["status_label"] = "Appearance Confirmed Match"
+                            if best["score"] >= 0.85:
+                                best["status_label"] = "Appearance Confirmed Match (High Confidence)"
+                            else:
+                                best["status_label"] = "Appearance Confirmed Match"
                             confirmed_camera_ids.append(cam_id)
                         else:
                             best["status"] = "AMBIGUOUS"
                             best["is_confirmed"] = False
-                            best["status_label"] = "Ambiguous Match"
+                            best["status_label"] = f"Ambiguous Match (Margin {cam_margin:.3f} < {effective_margin:.2f})"
                     else:
                         best["status"] = "NOT_DETECTED"
                         best["is_confirmed"] = False
@@ -322,8 +329,9 @@ class ScreenshotMatcher:
             is_reg, id_label = self.registry.is_track_registered(top1["track_id"])
             identity_display = id_label if is_reg else "Unregistered Person"
 
+            effective_global_margin = max(ambiguity_margin, 0.04)
             if top1_score >= score_threshold:
-                if margin >= ambiguity_margin:
+                if margin >= effective_global_margin:
                     decision = "CONFIRMED_MATCH"
                     msg = (
                         f"Confident match with track {top1['track_id']} "
@@ -335,7 +343,7 @@ class ScreenshotMatcher:
                     msg = (
                         f"Match candidate {top1['track_id']} exceeded threshold "
                         f"({top1_score:.3f}), but top-2 margin ({margin:.3f}) is below "
-                        f"ambiguity threshold ({ambiguity_margin:.2f})."
+                        f"ambiguity threshold ({effective_global_margin:.2f})."
                     )
             else:
                 decision = "UNKNOWN"

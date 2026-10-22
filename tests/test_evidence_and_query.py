@@ -20,7 +20,9 @@ def test_evidence_and_query():
     matcher = ScreenshotMatcher()
 
     # 1. Test Confident Query using a representative person crop
-    crop_path = Path("data/crops/Camera_1_7.jpg")
+    cam1_meta = load_json(config.METADATA_DIR / "Camera_1_tracks.json")
+    sample_id = sorted(list(cam1_meta.keys()))[0]
+    crop_path = Path(cam1_meta[sample_id]["representative_crop_path"])
     assert crop_path.exists(), f"Crop {crop_path} missing"
     crop_img = cv2.imread(str(crop_path))
     
@@ -32,11 +34,13 @@ def test_evidence_and_query():
     print(f"   Time Range: {query_res['top_candidate']['start_time']}s -> {query_res['top_candidate']['end_time']}s")
 
     assert query_res["decision"] == "CONFIRMED_MATCH", f"Expected CONFIRMED_MATCH, got {query_res['decision']}"
-    assert query_res["top_candidate"]["track_id"] == "Camera_1_7"
+    assert query_res["top_candidate"]["track_id"] == sample_id
     print("   [PASS] Distinctive crop retrieved exact track with CONFIRMED_MATCH.")
 
     # 2. Test Ambiguous Query detection
-    test_person_crop = cv2.imread("data/test_person_crop.jpg")
+    cam2_meta = load_json(config.METADATA_DIR / "Camera_2_tracks.json")
+    sample_id_2 = sorted(list(cam2_meta.keys()))[0]
+    test_person_crop = cv2.imread(cam2_meta[sample_id_2]["representative_crop_path"])
     amb_res = matcher.query_crop(test_person_crop, ambiguity_margin=0.05)
     print(f"\n2. Close-Appearance Ambiguity Handling:")
     print(f"   Decision: {amb_res['decision']}")
@@ -59,8 +63,8 @@ def test_evidence_and_query():
     print("\n4. Generating annotated video evidence with green bounding boxes...")
     gen = EvidenceGenerator()
     ev_res = gen.generate_annotated_evidence(
-        track_id="Camera_1_7",
-        display_label="Target Person: Camera_1_7",
+        track_id=sample_id,
+        display_label=f"Target Person: {sample_id}",
         max_frames_to_render=60
     )
 

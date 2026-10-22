@@ -268,3 +268,7 @@ class IdentityRegistry:
         """
         self.identities = {}
         self.save()
+
+    # Backwards compatibility alias
+    register_camera2_track = register_secondary_track
+
